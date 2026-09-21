@@ -795,26 +795,61 @@ impl GrpcService {
             Some(family) => convert::family_from_api(&family),
             None => Family::IPV4,
         };
-        let net = convert::net_from_api(path.nlri.ok_or(Error::EmptyArgument)?, family)
-            .map_err(|_| tonic::Status::new(tonic::Code::InvalidArgument, "prefix is invalid"))?;
+        // GoBGP gives the binary fields precedence when both forms are supplied.
+        let net = if path.nlri_binary.is_empty() {
+            convert::net_from_api(path.nlri.ok_or(Error::EmptyArgument)?, family)
+                .map_err(|_| tonic::Status::invalid_argument("prefix is invalid"))?
+        } else {
+            packet::Nlri::decode_from_bytes(family, &path.nlri_binary)
+                .map_err(|_| tonic::Status::invalid_argument("invalid binary NLRI"))?
+        };
+        let attributes = if path.pattrs_binary.is_empty() {
+            path.pattrs
+                .into_iter()
+                .map(|a| {
+                    convert::attr_from_api(a)
+                        .map_err(|_| tonic::Status::invalid_argument("invalid attribute"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            path.pattrs_binary
+                .iter()
+                .map(|a| {
+                    packet::Attribute::decode_from_bytes(a)
+                        .map_err(|_| tonic::Status::invalid_argument("invalid binary attribute"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let mut attr = Vec::new();
         let mut nexthop = None;
-        for a in path.pattrs {
-            let a = convert::attr_from_api(a).map_err(|_| {
-                tonic::Status::new(tonic::Code::InvalidArgument, "invalid attribute")
-            })?;
+        let mut seen = FnvHashSet::default();
+        for a in attributes {
+            if !seen.insert(a.code()) {
+                return Err(tonic::Status::invalid_argument("duplicate attribute"));
+            }
             match a.code() {
                 bgp::Attribute::MP_REACH => {
                     // MP_REACH binary: [AFI:2][SAFI:1][NH_LEN:1][nexthop:NH_LEN][reserved:1][NLRI...]
                     // Extract just the nexthop.
-                    let nh_len = a.binary().and_then(|b| b.get(3).copied()).unwrap_or(1) as usize;
-                    nexthop = a.binary().and_then(|b| {
-                        let len = *b.get(3)? as usize;
-                        if b.len() < 5 + len {
-                            return None;
-                        }
-                        bgp::Nexthop::from_bytes(&b[4..4 + len])
-                    });
+                    let b = a
+                        .binary()
+                        .ok_or_else(|| tonic::Status::invalid_argument("malformed MP_REACH"))?;
+                    if b.len() < 5
+                        || u16::from_be_bytes([b[0], b[1]]) != family.afi()
+                        || b[2] != family.safi()
+                        || b.len() < 5 + b[3] as usize
+                    {
+                        return Err(tonic::Status::invalid_argument("malformed MP_REACH"));
+                    }
+                    let nh_len = b[3] as usize;
+                    let nh_bytes = &b[4..4 + nh_len];
+                    // VPN nexthops include an eight-octet route distinguisher.
+                    let nh_bytes = if matches!(family, Family::IPV4_VPN | Family::IPV6_VPN) {
+                        nh_bytes.get(8..).unwrap_or_default()
+                    } else {
+                        nh_bytes
+                    };
+                    nexthop = bgp::Nexthop::from_bytes(nh_bytes);
                     // Flowspec carries no nexthop (RFC 8955 §4): nexthop_len=0 is valid.
                     let flowspec_no_nexthop = nh_len == 0
                         && matches!(
@@ -833,6 +868,9 @@ impl GrpcService {
                 }
                 bgp::Attribute::NEXTHOP => {
                     nexthop = a.binary().and_then(|b| bgp::Nexthop::from_bytes(b));
+                    if nexthop.is_none() {
+                        return Err(tonic::Status::invalid_argument("invalid nexthop"));
+                    }
                 }
                 // RR attributes are added on reflection and must not be set by operators.
                 // MP_UNREACH has no meaning in an add_path request.

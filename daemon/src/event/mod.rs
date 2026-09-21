@@ -3847,6 +3847,7 @@ async fn apply_disconnect(
 
 #[cfg(test)]
 mod tests {
+    mod gobgp_compat;
     use super::*;
     use std::net::Ipv4Addr;
 
