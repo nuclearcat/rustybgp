@@ -173,10 +173,11 @@ pub struct DestinationEntry {
 /// for gRPC `ListPath` responses and similar inspection APIs.
 ///
 /// Contains display fields (timestamp, RPKI validation, policy state) that are
-/// not needed for route distribution.  The nexthop is intentionally absent; it
-/// is embedded in the serialised UPDATE attributes for the API response.
+/// not needed for route distribution. The nexthop is kept separately, just as
+/// in the RIB, so API responses can reconstruct NEXT_HOP / MP_REACH attributes.
 pub struct PathEntry {
     pub source: Arc<Source>,
+    pub nexthop: Option<bgp::Nexthop>,
     /// AddPath path identifier received from the peer (0 when AddPath is not in use).
     /// AddPath path identifier received from the peer (0 when AddPath is not in use).
     pub remote_path_id: u32,
@@ -1081,6 +1082,7 @@ impl Table {
             .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
+                nexthop: p.path.nexthop,
                 remote_path_id: p.remote_path_id,
                 timestamp: p.timestamp,
                 attr: p.path.attr.clone(),
@@ -1103,6 +1105,7 @@ impl Table {
             .filter(|p| enable_filtered || !p.is_filtered())
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
+                nexthop: p.path.nexthop,
                 remote_path_id: p.remote_path_id,
                 timestamp: p.timestamp,
                 attr: p.original_attr.clone(),
@@ -1131,6 +1134,7 @@ impl Table {
         best.into_iter()
             .map(|p| PathEntry {
                 source: p.path.source.clone(),
+                nexthop: p.path.nexthop,
                 remote_path_id: 0,
                 timestamp: p.timestamp,
                 attr: p.original_attr.clone(),

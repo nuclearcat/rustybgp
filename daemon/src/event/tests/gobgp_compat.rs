@@ -68,6 +68,7 @@ fn binary_path(family: Family) -> api::Path {
 
 async fn add(svc: &GrpcService, path: api::Path) -> Result<api::AddPathResponse, tonic::Status> {
     svc.add_path(tonic::Request::new(api::AddPathRequest {
+        table_type: api::TableType::Global as i32,
         path: Some(path),
         ..Default::default()
     }))
@@ -310,4 +311,208 @@ async fn structured_legacy_withdraw_needs_only_nlri() {
     path.pattrs.clear();
     add(&svc, path).await.unwrap();
     assert!(svc.tables.collect_loc_rib_paths(Family::IPV4).is_empty());
+}
+
+async fn list(svc: &GrpcService, request: api::ListPathRequest) -> Vec<api::Destination> {
+    svc.list_path(tonic::Request::new(request))
+        .await
+        .unwrap()
+        .into_inner()
+        .map(|r| r.unwrap().destination.unwrap())
+        .collect()
+        .await
+}
+
+#[tokio::test]
+async fn list_path_returns_binary_nexthops_and_flowspec_nlri() {
+    for family in [
+        Family::IPV4,
+        Family::IPV6,
+        Family::IPV4_FLOWSPEC,
+        Family::IPV6_FLOWSPEC,
+    ] {
+        let svc = make_grpc_service();
+        let path = binary_path(family);
+        add(&svc, path.clone()).await.unwrap();
+        for only_binary in [false, true] {
+            let results = list(
+                &svc,
+                api::ListPathRequest {
+                    table_type: api::TableType::Global as i32,
+                    family: path.family,
+                    enable_attribute_binary: true,
+                    enable_nlri_binary: only_binary,
+                    enable_only_binary: only_binary,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(results.len(), 1);
+            let returned = &results[0].paths[0];
+            assert_eq!(returned.nlri.is_none(), only_binary);
+            assert_eq!(returned.pattrs.is_empty(), only_binary);
+            if only_binary {
+                assert_eq!(returned.nlri_binary, path.nlri_binary);
+            } else {
+                assert!(returned.nlri_binary.is_empty());
+            }
+            // Compare the complete MP_REACH body, including its NLRI.
+            for expected in &path.pattrs_binary {
+                let expected = packet::Attribute::decode_from_bytes(expected).unwrap();
+                let matches: Vec<_> = returned
+                    .pattrs_binary
+                    .iter()
+                    .map(|a| packet::Attribute::decode_from_bytes(a).unwrap())
+                    .filter(|a| a.code() == expected.code())
+                    .collect();
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0].binary(), expected.binary());
+                assert_eq!(matches[0].value(), expected.value());
+            }
+            if !only_binary && family != Family::IPV4 {
+                let mp = returned
+                    .pattrs
+                    .iter()
+                    .find_map(|a| match &a.attr {
+                        Some(api::attribute::Attr::MpReach(mp)) => Some(mp),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(mp.family, path.family);
+                assert_eq!(mp.nlris, vec![returned.nlri.clone().unwrap()]);
+                assert_eq!(mp.next_hops.is_empty(), family.safi() == 133);
+            }
+        }
+        add(
+            &svc,
+            api::Path {
+                is_withdraw: true,
+                ..path
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            list(
+                &svc,
+                api::ListPathRequest {
+                    table_type: api::TableType::Global as i32,
+                    family: Some(convert::family_to_api(family)),
+                    enable_only_binary: true,
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn binary_exact_prefix_lookup_excludes_other_routes() {
+    let svc = make_grpc_service();
+    let path = binary_path(Family::IPV4);
+    add(&svc, path.clone()).await.unwrap();
+    add(&svc, ipv4_path("10.0.0.0", 24, "192.0.2.1"))
+        .await
+        .unwrap();
+    let results = list(
+        &svc,
+        api::ListPathRequest {
+            table_type: api::TableType::Global as i32,
+            family: path.family,
+            enable_only_binary: true,
+            prefixes: vec![api::TableLookupPrefix {
+                prefix: "198.51.100.42/32".into(),
+                r#type: api::table_lookup_prefix::Type::Exact as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].prefix, "198.51.100.42/32");
+    assert_eq!(results[0].paths[0].nlri_binary, path.nlri_binary);
+}
+
+#[tokio::test]
+async fn binary_requests_round_trip_over_grpc() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(GoBgpServiceServer::new(make_grpc_service()))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stop_rx.await;
+                },
+            )
+            .await
+            .unwrap();
+    });
+    let mut client =
+        api::go_bgp_service_client::GoBgpServiceClient::connect(format!("http://{address}"))
+            .await
+            .unwrap();
+    for family in [
+        Family::IPV4,
+        Family::IPV6,
+        Family::IPV4_FLOWSPEC,
+        Family::IPV6_FLOWSPEC,
+    ] {
+        let path = binary_path(family);
+        let request = api::AddPathRequest {
+            table_type: api::TableType::Global as i32,
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        let uuid = client
+            .add_path(request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .uuid;
+        assert_eq!(uuid.len(), 16);
+        let list_request = api::ListPathRequest {
+            table_type: api::TableType::Global as i32,
+            family: path.family,
+            enable_only_binary: true,
+            ..Default::default()
+        };
+        let mut stream = client
+            .list_path(list_request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+        let destination = stream
+            .message()
+            .await
+            .unwrap()
+            .unwrap()
+            .destination
+            .unwrap();
+        assert_eq!(destination.paths[0].nlri_binary, path.nlri_binary);
+        assert!(!destination.paths[0].pattrs_binary.is_empty());
+        assert!(stream.message().await.unwrap().is_none());
+        let response = client
+            .add_path(api::AddPathRequest {
+                path: Some(api::Path {
+                    is_withdraw: true,
+                    ..path
+                }),
+                ..request
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.uuid.is_empty());
+        let mut stream = client.list_path(list_request).await.unwrap().into_inner();
+        assert!(stream.message().await.unwrap().is_none());
+    }
+    drop(client);
+    stop_tx.send(()).unwrap();
+    server.await.unwrap();
 }
