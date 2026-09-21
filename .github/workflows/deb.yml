@@ -1,0 +1,113 @@
+name: Ubuntu Debian packages
+
+on:
+  push:
+    branches: [fix/gobgp-api-compat]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deb-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    if: github.repository == 'nuclearcat/rustybgp'
+    name: Ubuntu ${{ matrix.ubuntu }} amd64
+    runs-on: ubuntu-${{ matrix.ubuntu }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ['24.04', '26.04']
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_TOOLCHAIN: '1.97.1'
+      UBUNTU_VERSION: ${{ matrix.ubuntu }}
+      DEB_MAINTAINER: '${{ github.repository_owner }} <${{ github.repository_owner }}@users.noreply.github.com>'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential protobuf-compiler libprotobuf-dev dpkg-dev
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-ubuntu-${{ matrix.ubuntu }}
+
+      - name: Resolve dependencies and set package version
+        run: |
+          cargo generate-lockfile
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          revision = subprocess.check_output(['git', 'rev-parse', '--short=10', 'HEAD'], text=True).strip()
+          timestamp = subprocess.check_output(['git', 'show', '-s', '--format=%ct', 'HEAD'], text=True).strip()
+          version += f"+git{timestamp}.{revision}-1ubuntu{os.environ['UBUNTU_VERSION']}.{os.environ['GITHUB_RUN_NUMBER']}.{os.environ['GITHUB_RUN_ATTEMPT']}"
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'DEB_VERSION={version}\n')
+          PY
+
+      - name: Test and build
+        run: |
+          cargo test --workspace --locked
+          cargo build --release --locked -p rustybgpd
+
+      - name: Build Debian package
+        run: |
+          bash packaging/build-deb.sh
+          cp Cargo.lock "target/debian/Cargo-ubuntu-${UBUNTU_VERSION}.lock"
+
+      - name: Install and smoke-test package
+        run: |
+          sudo apt-get install -y ./target/debian/*.deb
+          /usr/bin/rustybgpd --version
+          /usr/bin/rustybgpd --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rustybgpd-ubuntu-${{ matrix.ubuntu }}-amd64
+          path: |
+            target/debian/*.deb
+            target/debian/*.sha256
+            target/debian/*.lock
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  release:
+    name: Publish downloadable packages
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rustybgpd-ubuntu-*-amd64
+          path: packages
+          merge-multiple: true
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="ubuntu-debs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" \
+            --target "$GITHUB_SHA" \
+            --title "Ubuntu packages (build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT})" \
+            --notes "Debian packages for Ubuntu 24.04 and 26.04 (amd64). Built from commit ${GITHUB_SHA}." \
+            --prerelease \
+            packages/*.deb packages/*.sha256
