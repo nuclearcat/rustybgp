@@ -1,6 +1,15 @@
 //! Public GoBGP v4 API compatibility tests using synthetic BGP wire fixtures.
 use super::*;
 
+async fn delete(svc: &GrpcService, uuid: Vec<u8>) -> Result<(), tonic::Status> {
+    svc.delete_path(tonic::Request::new(api::DeletePathRequest {
+        uuid,
+        ..Default::default()
+    }))
+    .await
+    .map(|_| ())
+}
+
 fn binary_path(family: Family) -> api::Path {
     let ipv6 = family.afi() == 2;
     let flowspec = family.safi() == 133;
@@ -193,4 +202,112 @@ async fn malformed_binary_requests_do_not_install_routes() {
         );
         assert!(svc.tables.collect_loc_rib_paths(Family::IPV4).is_empty());
     }
+}
+
+#[tokio::test]
+async fn legacy_withdraw_and_uuid_delete_work_for_unicast_and_flowspec() {
+    for family in [
+        Family::IPV4,
+        Family::IPV6,
+        Family::IPV4_FLOWSPEC,
+        Family::IPV6_FLOWSPEC,
+    ] {
+        let svc = make_grpc_service();
+        let path = binary_path(family);
+        let old_uuid = add(&svc, path.clone()).await.unwrap().uuid;
+        let withdrawal = api::Path {
+            is_withdraw: true,
+            ..path.clone()
+        };
+        assert!(add(&svc, withdrawal.clone()).await.unwrap().uuid.is_empty());
+        assert!(svc.tables.collect_loc_rib_paths(family).is_empty());
+        // Withdrawing an absent path is idempotent.
+        assert!(add(&svc, withdrawal).await.unwrap().uuid.is_empty());
+        let new_uuid = add(&svc, path).await.unwrap().uuid;
+        assert_eq!(
+            delete(&svc, old_uuid).await.unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(svc.tables.collect_loc_rib_paths(family).len(), 1);
+        delete(&svc, new_uuid).await.unwrap();
+        assert!(svc.tables.collect_loc_rib_paths(family).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn legacy_withdraw_is_scoped_to_local_source_prefix_and_path_id() {
+    let svc = make_grpc_service();
+    let path = binary_path(Family::IPV4);
+    let nlri = packet::Nlri::decode_from_bytes(Family::IPV4, &path.nlri_binary).unwrap();
+    let peer = Arc::new(table::Source::new(
+        "192.0.2.2".parse().unwrap(),
+        "192.0.2.1".parse().unwrap(),
+        65002,
+        65001,
+        "192.0.2.2".parse().unwrap(),
+        table::PeerRole::Ebgp,
+    ));
+    svc.tables.insert_route(
+        peer.clone(),
+        Family::IPV4,
+        packet::PathNlri::new(nlri),
+        Some(bgp::Nexthop::V4("192.0.2.2".parse().unwrap())),
+        Arc::new(vec![packet::Attribute::empty_as_path()]),
+        None,
+        0,
+    );
+    add(&svc, path.clone()).await.unwrap();
+    let other_id_uuid = add(
+        &svc,
+        api::Path {
+            identifier: 7,
+            ..path.clone()
+        },
+    )
+    .await
+    .unwrap()
+    .uuid;
+    let other_prefix_uuid = add(&svc, ipv4_path("10.0.0.0", 24, "192.0.2.1"))
+        .await
+        .unwrap()
+        .uuid;
+    add(
+        &svc,
+        api::Path {
+            is_withdraw: true,
+            ..path
+        },
+    )
+    .await
+    .unwrap();
+    let paths = svc.tables.collect_loc_rib_paths(Family::IPV4);
+    assert_eq!(paths.len(), 2);
+    let target = paths
+        .iter()
+        .find(|p| p.net.to_string() == "198.51.100.42/32")
+        .unwrap();
+    assert_eq!(target.current_paths.len(), 2); // remote + local path ID 7
+    assert!(
+        target
+            .current_paths
+            .iter()
+            .any(|p| Arc::ptr_eq(&p.source, &peer))
+    );
+    delete(&svc, other_id_uuid).await.unwrap();
+    delete(&svc, other_prefix_uuid).await.unwrap();
+    let remaining = svc.tables.collect_loc_rib_paths(Family::IPV4);
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].current_paths.len(), 1);
+    assert!(Arc::ptr_eq(&remaining[0].current_paths[0].source, &peer));
+}
+
+#[tokio::test]
+async fn structured_legacy_withdraw_needs_only_nlri() {
+    let svc = make_grpc_service();
+    let mut path = ipv4_path("10.0.0.0", 24, "192.0.2.1");
+    add(&svc, path.clone()).await.unwrap();
+    path.is_withdraw = true;
+    path.pattrs.clear();
+    add(&svc, path).await.unwrap();
+    assert!(svc.tables.collect_loc_rib_paths(Family::IPV4).is_empty());
 }
