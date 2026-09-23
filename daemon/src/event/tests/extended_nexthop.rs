@@ -48,6 +48,15 @@ async fn wait_prefixes(tables: &TableHandle, peer: IpAddr, expected: u64) {
 
 #[tokio::test]
 async fn ipv4_session_receives_ipv6_nexthop_without_remote_capability() {
+    receive_ipv4_routes(false).await;
+}
+
+#[tokio::test]
+async fn plain_ibgp_accepts_cluster_list_containing_router_id() {
+    receive_ipv4_routes(true).await;
+}
+
+async fn receive_ipv4_routes(with_cluster_list: bool) {
     for role in [crate::fsm::Role::Active, crate::fsm::Role::Passive] {
         let global = make_global();
         let tables = make_tables();
@@ -113,6 +122,12 @@ async fn ipv4_session_receives_ipv6_nexthop_without_remote_capability() {
         let mut common = vec![0x40, 1, 1, 0, 0x40, 2, 6, 2, 1];
         common.extend_from_slice(&1299u32.to_be_bytes());
         common.extend_from_slice(&[0x40, 5, 4, 0, 0, 0, 100]);
+        if with_cluster_list {
+            // A plain iBGP receiver has no local cluster. Even a CLUSTER_LIST
+            // entry equal to its router ID is not a reflection loop.
+            common.extend_from_slice(&[0x80, 10, 4, 217, 28, 63, 34]);
+            common.extend_from_slice(&[0x80, 9, 4, 192, 0, 2, 10]);
+        }
         let prefixes = [24, 198, 51, 100, 24, 203, 0, 113];
         let mut mp = vec![0, 1, 1, 16];
         mp.extend_from_slice(&next_hop.octets());

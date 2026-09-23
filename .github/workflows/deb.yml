@@ -139,6 +139,7 @@ jobs:
           cat > release-notes.md <<EOF
           Debian packages for Ubuntu 24.04 and 26.04 (baseline amd64).
 
+          Fixes false CLUSTER_LIST loop rejection on plain iBGP sessions while preserving route-reflector loop protection.
           Advertises IPv4 routes with IPv6 next-hop support on IPv4 and IPv6 BGP sessions.
           Exits with an error if the gRPC API port cannot be bound.
           Adds rate-limited receive diagnostics for UPDATE validation and loop rejection.
