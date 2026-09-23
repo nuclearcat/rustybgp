@@ -1173,7 +1173,7 @@ impl Global {
         active_tx: mpsc::UnboundedSender<TcpStream>,
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
         api_sockaddr: SocketAddr,
-    ) {
+    ) -> std::io::Result<()> {
         let (kernel_event_tx, mut kernel_event_rx) =
             mpsc::unbounded_channel::<kernel::KernelEvent>();
         let (bfd_event_tx, mut bfd_event_rx) = mpsc::unbounded_channel::<crate::bfd::BfdEvent>();
@@ -1480,9 +1480,15 @@ impl Global {
                 let ifindex = device.map(auth::ifindex_of).unwrap_or(0);
                 let sockets = addrs
                     .into_iter()
-                    .map(|addr| create_listen_socket(addr, device))
-                    .filter_map(|x| x.ok())
-                    .collect::<Vec<_>>();
+                    .map(|addr| {
+                        create_listen_socket(addr, device).map_err(|err| {
+                            std::io::Error::new(
+                                err.kind(),
+                                format!("failed to listen on BGP {addr}: {err}"),
+                            )
+                        })
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()?;
                 (sockets, ifindex)
             } else {
                 (Vec::new(), 0)
@@ -1767,7 +1773,7 @@ pub(crate) async fn main(
     any_peer: bool,
     is_restarting: bool,
     api_sockaddr: SocketAddr,
-) {
+) -> std::io::Result<()> {
     let (active_tx, active_rx) = mpsc::unbounded_channel();
     Global::serve(
         bgp,
@@ -1777,7 +1783,7 @@ pub(crate) async fn main(
         active_rx,
         api_sockaddr,
     )
-    .await;
+    .await
 }
 
 /// For an IPv6 socket, find the link-local address of the same interface.
@@ -10617,6 +10623,26 @@ port = 3323
             }),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn startup_bind_failure_returns_error() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::main(
+                Some(port_config(Some(i32::from(port)))),
+                false,
+                false,
+                "127.0.0.1:0".parse().unwrap(),
+            ),
+        )
+        .await
+        .expect("startup must return instead of running without a BGP listener")
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains(&format!("BGP 0.0.0.0:{port}")));
     }
 
     #[test]

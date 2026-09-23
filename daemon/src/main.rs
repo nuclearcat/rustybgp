@@ -134,6 +134,5 @@ async fn main() -> Result<(), std::io::Error> {
         args.get_flag("graceful-restart"),
         api_sockaddr,
     )
-    .await;
-    Ok(())
+    .await
 }
