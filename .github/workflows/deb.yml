@@ -16,7 +16,11 @@ jobs:
   package:
     if: github.repository == 'nuclearcat/rustybgp'
     name: Ubuntu ${{ matrix.ubuntu }} amd64
-    runs-on: ubuntu-${{ matrix.ubuntu }}
+    runs-on: ubuntu-24.04
+    # The 26.04 hosted runner uses amd64v3 packages, including a GCC that
+    # defaults to x86-64-v3. Use the baseline distribution for every input
+    # to the build, including startup objects and static libraries.
+    container: ubuntu:${{ matrix.ubuntu }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -25,22 +29,31 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUST_TOOLCHAIN: '1.97.1'
+      RUSTFLAGS: '-C target-cpu=x86-64'
+      CFLAGS: '-march=x86-64 -mtune=generic'
+      CXXFLAGS: '-march=x86-64 -mtune=generic'
       UBUNTU_VERSION: ${{ matrix.ubuntu }}
       DEB_MAINTAINER: '${{ github.repository_owner }} <${{ github.repository_owner }}@users.noreply.github.com>'
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential protobuf-compiler libprotobuf-dev dpkg-dev
-          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
-          rustup default "$RUST_TOOLCHAIN"
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential protobuf-compiler libprotobuf-dev dpkg-dev \
+            ca-certificates curl git python3 qemu-user
+          if dpkg-query -W -f='${Package} ${Architecture-Variant}\n' | grep -w amd64v3; then
+            echo 'Refusing to build baseline packages with amd64v3 dependencies' >&2
+            exit 1
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: deb-ubuntu-${{ matrix.ubuntu }}
+          key: deb-baseline-amd64-v1-ubuntu-${{ matrix.ubuntu }}
 
       - name: Resolve dependencies and set package version
         run: |
@@ -71,9 +84,14 @@ jobs:
 
       - name: Install and smoke-test package
         run: |
-          sudo apt-get install -y ./target/debian/*.deb
+          apt-get install -y ./target/debian/*.deb
           /usr/bin/rustybgpd --version
           /usr/bin/rustybgpd --help
+
+      - name: Smoke-test package without AVX
+        run: |
+          qemu-x86_64 -cpu Nehalem /usr/bin/rustybgpd --version
+          qemu-x86_64 -cpu Nehalem /usr/bin/rustybgpd --help
 
       - uses: actions/upload-artifact@v4
         with:
@@ -105,9 +123,21 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           tag="ubuntu-debs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          debs=(packages/*.deb)
+          package_version=$(dpkg-deb -f "${debs[0]}" Version)
+          version=${package_version%%+*}
+          cat > release-notes.md <<EOF
+          Debian packages for Ubuntu 24.04 and 26.04 (baseline amd64).
+
+          Fixes the unintended x86-64-v3 requirement in the Ubuntu 26.04 package.
+          Built with baseline Rust and C CPU targets in standard Ubuntu containers.
+          Both packages pass --version and --help under an emulated Nehalem CPU without AVX.
+
+          Built from commit ${GITHUB_SHA}. SHA-256 checksums are included.
+          EOF
           gh release create "$tag" \
             --target "$GITHUB_SHA" \
-            --title "Ubuntu packages (build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT})" \
-            --notes "Debian packages for Ubuntu 24.04 and 26.04 (amd64). Built from commit ${GITHUB_SHA}." \
+            --title "Ubuntu packages ${version} (build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT})" \
+            --notes-file release-notes.md \
             --prerelease \
             packages/*.deb packages/*.sha256
