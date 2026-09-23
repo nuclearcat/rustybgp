@@ -21,6 +21,9 @@ jobs:
     # defaults to x86-64-v3. Use the baseline distribution for every input
     # to the build, including startup objects and static libraries.
     container: ubuntu:${{ matrix.ubuntu }}
+    defaults:
+      run:
+        shell: bash
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -50,6 +53,9 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
+
+      - name: Trust the runner-mounted checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - uses: Swatinem/rust-cache@v2
         with:
