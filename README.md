@@ -26,6 +26,27 @@ Peer            AS Up/Down State       |#Received  Accepted
 198.51.100.2 65002   never Idle        |        0         0
 ```
 
+### Debian packages and systemd
+
+The Debian packages include `rustybgpd.service`. Installation leaves it stopped
+and disabled. Create your configuration from the packaged example, edit the ASN,
+router ID and neighbors, then start the service:
+
+```bash
+sudo install -m 600 /usr/share/rustybgpd/examples/rustybgpd.yaml /etc/rustybgpd/rustybgpd.yaml
+sudo editor /etc/rustybgpd/rustybgpd.yaml
+sudo systemctl enable --now rustybgpd.service
+sudo journalctl -u rustybgpd.service -f
+```
+
+The service runs as root to bind BGP port 179 and support kernel route management.
+Its gRPC API listens on `127.0.0.1:50051`. Use `systemctl edit rustybgpd.service`
+to override service options. Relative MRT output paths use `/var/lib/rustybgpd`.
+After configuration changes, run `sudo systemctl restart rustybgpd.service`.
+
+Package upgrades preserve your configuration and enablement choice, and restart
+the service only if it is already running. Package removal stops it.
+
 ## Supported Features
 
 - Route Reflector (RFC 4456)

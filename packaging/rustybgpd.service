@@ -1,0 +1,16 @@
+[Unit]
+Description=RustyBGP routing daemon
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/etc/rustybgpd/rustybgpd.yaml
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/rustybgpd --config-file /etc/rustybgpd/rustybgpd.yaml --api-hosts 127.0.0.1:50051
+StateDirectory=rustybgpd
+WorkingDirectory=/var/lib/rustybgpd
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

@@ -42,7 +42,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential protobuf-compiler libprotobuf-dev dpkg-dev \
+            build-essential protobuf-compiler libprotobuf-dev dpkg-dev debhelper systemd \
             ca-certificates curl git python3 qemu-user
           if dpkg-query -W -f='${Package} ${Architecture-Variant}\n' | grep -w amd64v3; then
             echo 'Refusing to build baseline packages with amd64v3 dependencies' >&2
@@ -93,6 +93,10 @@ jobs:
           apt-get install -y ./target/debian/*.deb
           /usr/bin/rustybgpd --version
           /usr/bin/rustybgpd --help
+          systemd-analyze verify /usr/lib/systemd/system/rustybgpd.service
+          test "$(systemctl is-enabled rustybgpd.service || true)" = disabled
+          test -f /usr/share/rustybgpd/examples/rustybgpd.yaml
+          test ! -e /etc/rustybgpd/rustybgpd.yaml
 
       - name: Smoke-test package without AVX
         run: |
@@ -138,6 +142,9 @@ jobs:
           Fixes the unintended x86-64-v3 requirement in the Ubuntu 26.04 package.
           Built with baseline Rust and C CPU targets in standard Ubuntu containers.
           Both packages pass --version and --help under an emulated Nehalem CPU without AVX.
+
+          Includes rustybgpd.service, installed disabled and stopped until configured.
+          See the README for configuration and service startup instructions.
 
           Built from commit ${GITHUB_SHA}. SHA-256 checksums are included.
           EOF

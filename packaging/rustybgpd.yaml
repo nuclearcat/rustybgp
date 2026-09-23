@@ -1,0 +1,7 @@
+# Set your own ASN and router ID before starting the service.
+# Add neighbors using the GoBGP configuration format.
+global:
+  config:
+    as: 64512
+    router-id: 192.0.2.1
+    port: 179
