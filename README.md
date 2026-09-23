@@ -53,6 +53,7 @@ the service only if it is already running. Package removal stops it.
 - BGP Confederation (RFC 5065)
 - Route Server (RFC 7947)
 - Add-Path (RFC 7911)
+- IPv4 routes with IPv6 next hops (RFC 8950), over IPv4 or IPv6 BGP sessions
 - Graceful Restart (RFC 4724)
 - Long-Lived Graceful Restart (RFC 9494)
 - RPKI (RFC 6810, RFC 8210)

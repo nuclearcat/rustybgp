@@ -139,7 +139,10 @@ jobs:
           cat > release-notes.md <<EOF
           Debian packages for Ubuntu 24.04 and 26.04 (baseline amd64).
 
-          Fixes the unintended x86-64-v3 requirement in the Ubuntu 26.04 package.
+          Advertises IPv4 routes with IPv6 next-hop support on IPv4 and IPv6 BGP sessions.
+          Exits with an error if the gRPC API port cannot be bound.
+          Adds rate-limited receive diagnostics for UPDATE validation and loop rejection.
+
           Built with baseline Rust and C CPU targets in standard Ubuntu containers.
           Both packages pass --version and --help under an emulated Nehalem CPU without AVX.
 

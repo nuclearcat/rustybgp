@@ -35,6 +35,7 @@ use tokio::sync::{Notify, mpsc};
 use tokio::time::Duration;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tonic::transport::server::TcpIncoming;
 
 use crate::api::go_bgp_service_server::{GoBgpService, GoBgpServiceServer};
 
@@ -151,7 +152,9 @@ impl MessageCounter {
 }
 
 mod grpc;
+mod receive;
 use grpc::GrpcService;
+use receive::ReceiveDiagnostics;
 
 mod peer;
 pub(super) use peer::{
@@ -1174,6 +1177,16 @@ impl Global {
         mut active_rx: mpsc::UnboundedReceiver<TcpStream>,
         api_sockaddr: SocketAddr,
     ) -> std::io::Result<()> {
+        // Bind before starting peers or background services so an unavailable
+        // management API is a startup error, not a detached task panic.
+        let api_incoming = TcpIncoming::bind(api_sockaddr)
+            .map_err(|err| {
+                std::io::Error::new(
+                    err.kind(),
+                    format!("failed to listen on gRPC API {api_sockaddr}: {err}"),
+                )
+            })?
+            .with_nodelay(Some(true));
         let (kernel_event_tx, mut kernel_event_rx) =
             mpsc::unbounded_channel::<kernel::KernelEvent>();
         let (bfd_event_tx, mut bfd_event_rx) = mpsc::unbounded_channel::<crate::bfd::BfdEvent>();
@@ -1451,7 +1464,7 @@ impl Global {
             tables.clone(),
             notify.clone(),
             active_tx.clone(),
-            api_sockaddr,
+            api_incoming,
         );
 
         loop {
@@ -1745,14 +1758,14 @@ fn start_grpc_server(
     tables: TableHandle,
     notify: Arc<tokio::sync::Notify>,
     active_tx: mpsc::UnboundedSender<TcpStream>,
-    addr: SocketAddr,
+    incoming: TcpIncoming,
 ) {
     tokio::spawn(async move {
         if let Err(err) = tonic::transport::Server::builder()
             .add_service(GoBgpServiceServer::new(GrpcService::new(
                 notify, active_tx, global, tables,
             )))
-            .serve(addr)
+            .serve_with_incoming(incoming)
             .await
         {
             panic!("failed to listen on grpc {}", err);
@@ -2261,6 +2274,7 @@ enum Step {
 /// `Arc<Mutex<ConnArbiter>>`.
 struct PeerSession {
     remote_addr: IpAddr,
+    receive_diagnostics: ReceiveDiagnostics,
 
     export_ctx: PeerExportContext,
 
@@ -2358,6 +2372,7 @@ impl PeerSession {
 
         Some(PeerSession {
             remote_addr,
+            receive_diagnostics: ReceiveDiagnostics::default(),
             export_ctx,
             state: res.state,
             counter_tx: res.counter_tx,
@@ -2419,6 +2434,7 @@ impl PeerSession {
 
         PeerSession {
             remote_addr,
+            receive_diagnostics: ReceiveDiagnostics::default(),
             export_ctx: PeerExportContext {
                 role: PeerRole::Ebgp,
                 local_asn,
@@ -3115,7 +3131,7 @@ impl PeerSession {
     ) -> bool {
         // RFC 4456 §8 loop detection: discard UPDATE if ORIGINATOR_ID equals
         // local router-id, or if CLUSTER_LIST already contains local cluster-id.
-        if reach.is_some() {
+        if let Some(reach) = &reach {
             let local_rid = u32::from(self.local_router_id);
             let originator_loop = attr
                 .iter()
@@ -3131,6 +3147,24 @@ impl PeerSession {
                     })
             });
             if originator_loop || cluster_loop {
+                let (reason, count) = if originator_loop {
+                    (
+                        "ORIGINATOR_ID equals local router ID",
+                        &mut self.receive_diagnostics.originator_loop,
+                    )
+                } else {
+                    (
+                        "CLUSTER_LIST contains local cluster ID",
+                        &mut self.receive_diagnostics.cluster_loop,
+                    )
+                };
+                ReceiveDiagnostics::reject(
+                    self.remote_addr,
+                    reason,
+                    count,
+                    reach.family,
+                    &reach.entries,
+                );
                 return false;
             }
         }
@@ -3335,6 +3369,11 @@ impl PeerSession {
 
         // For UPDATE EndOfRib: notify EOR watchers unconditionally; signal GR if negotiated.
         if let Some(family) = eor_family {
+            log::info!(
+                "{}: End-of-RIB for {family:?}; session receive totals (prefixes count announcements, not unique routes): {:?}",
+                self.remote_addr,
+                self.receive_diagnostics,
+            );
             if let Some(source) = self.source.get(&family) {
                 self.tables.notify_eor(source.clone(), family);
             }
@@ -3496,6 +3535,7 @@ impl PeerSession {
                                     Some(parsed) => {
                                         // Count one wire frame before validate_message moves `parsed`.
                                         (*self.counter_rx).sync_rx(&parsed);
+                                        let announced = self.receive_diagnostics.observe(self.remote_addr, &parsed);
                                         let is_ebgp = matches!(self.export_ctx.role, PeerRole::Ebgp);
                                         match bgp::validate_message(parsed, is_ebgp) {
                                             Err(notif) => {
@@ -3505,21 +3545,25 @@ impl PeerSession {
                                                 };
                                             }
                                             Ok(iter) => {
+                                                let mut retained = 0;
                                                 for msg in iter {
-                                                    if let bgp::Message::Update(bgp::Update::Reach { attr, .. }) = &msg
-                                                        && is_as_loop(
+                                                    if let bgp::Message::Update(bgp::Update::Reach { attr, family, entries, .. }) = &msg {
+                                                        retained += entries.len() as u64;
+                                                        if is_as_loop(
                                                             attr,
                                                             self.export_ctx.local_asn,
                                                             self.export_ctx.confederation_id,
-                                                        )
-                                                    {
-                                                        continue;
+                                                        ) {
+                                                            ReceiveDiagnostics::reject(self.remote_addr, "AS_PATH contains local AS or confederation ID", &mut self.receive_diagnostics.as_loop, *family, entries);
+                                                            continue;
+                                                        }
                                                     }
                                                     let step = self.rx_msg(global, local_sockaddr, remote_sockaddr, msg).await;
                                                     if matches!(step, Step::Terminate { .. }) {
                                                         return step;
                                                     }
                                                 }
+                                                self.receive_diagnostics.validated(self.remote_addr, announced, retained);
                                             }
                                         }
                                     }
@@ -3851,6 +3895,7 @@ async fn apply_disconnect(
 
 #[cfg(test)]
 mod tests {
+    mod extended_nexthop;
     mod gobgp_compat;
     use super::*;
     use std::net::Ipv4Addr;
@@ -9423,7 +9468,7 @@ mod tests {
         )));
         assert!(has_cap(&caps, CAP_FOUR_OCTET_ASN));
         assert!(!has_cap(&caps, CAP_ADDPATH));
-        assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+        assert!(has_cap(&caps, CAP_EXTENDED_NEXTHOP));
     }
 
     #[test]
@@ -9462,30 +9507,58 @@ mod tests {
     }
 
     #[test]
-    fn build_local_cap_ipv4_peer_with_ipv4_family_no_extended_nexthop() {
+    fn build_local_cap_ipv4_peer_with_ipv4_family_includes_extended_nexthop() {
         let remote_addr: IpAddr = "10.0.0.1".parse().unwrap();
         let mut families = FnvHashMap::default();
         families.insert(Family::IPV4, 0u8);
         let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
-        assert!(!has_cap(&caps, CAP_EXTENDED_NEXTHOP));
+        assert!(caps.iter().any(|c| matches!(
+            c,
+            packet::Capability::ExtendedNexthop(fams)
+                if fams == &vec![(Family::IPV4, Family::AFI_IP6)]
+        )));
     }
 
     #[test]
-    fn build_local_cap_ipv6_peer_srpolicy_excluded_from_extended_nexthop() {
-        // IPV4_SRPOLICY must not appear in ExtendedNexthop: its nexthop is
-        // always the originator IPv4 address, not an IPv6-mapped address.
-        let remote_addr: IpAddr = "2001:db8::1".parse().unwrap();
-        let mut families = FnvHashMap::default();
-        families.insert(Family::IPV4, 0u8);
-        families.insert(Family::IPV4_SRPOLICY, 0u8);
-        let caps = PeerParams::build_local_cap(remote_addr, 65001, &families, None, None);
-        // ExtendedNexthop is still advertised for IPV4, but not for IPV4_SRPOLICY.
-        assert!(has_cap(&caps, CAP_EXTENDED_NEXTHOP));
-        assert!(!caps.iter().any(|c| matches!(
-            c,
-            packet::Capability::ExtendedNexthop(fams)
-                if fams.iter().any(|(f, _)| *f == Family::IPV4_SRPOLICY)
-        )));
+    fn build_local_cap_extended_nexthop_only_rfc8950_families() {
+        let supported = [
+            Family::IPV4,
+            Family::IPV4_MC,
+            Family::IPV4_MPLS,
+            Family::IPV4_VPN,
+        ];
+        let excluded = [
+            Family::IPV6,
+            Family::IPV4_SRPOLICY,
+            Family::RTC,
+            Family::IPV4_FLOWSPEC,
+            Family::IPV4_MUP,
+        ];
+        let families = supported
+            .into_iter()
+            .chain(excluded)
+            .map(|f| (f, 0))
+            .collect();
+        for remote_addr in ["10.0.0.1", "2001:db8::1"] {
+            let caps = PeerParams::build_local_cap(
+                remote_addr.parse().unwrap(),
+                65001,
+                &families,
+                None,
+                None,
+            );
+            let tuples = caps
+                .iter()
+                .find_map(|cap| match cap {
+                    packet::Capability::ExtendedNexthop(tuples) => Some(tuples),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(tuples.len(), supported.len());
+            for f in supported {
+                assert!(tuples.contains(&(f, Family::AFI_IP6)));
+            }
+        }
     }
 
     #[test]
@@ -10068,6 +10141,8 @@ port = 3323
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");
+        assert_eq!(session.receive_diagnostics.originator_loop.prefixes, 1);
+        assert_eq!(session.receive_diagnostics.cluster_loop.prefixes, 0);
         let state = tables.table_state(Family::IPV4);
         assert_eq!(state.num_destination, 0, "route must not be inserted");
     }
@@ -10090,6 +10165,8 @@ port = 3323
             .await;
 
         assert!(!exceeded, "loop detection must not trigger CEASE");
+        assert_eq!(session.receive_diagnostics.cluster_loop.prefixes, 1);
+        assert_eq!(session.receive_diagnostics.originator_loop.prefixes, 0);
         let state = tables.table_state(Family::IPV4);
         assert_eq!(state.num_destination, 0, "route must not be inserted");
     }
@@ -10659,6 +10736,24 @@ port = 3323
                 ..Default::default()
             }),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_api_bind_failure_returns_error() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = occupied.local_addr().unwrap();
+        // Check both API-only startup and configured BGP with no listener.
+        for bgp in [None, Some(port_config(Some(-1)))] {
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                super::main(bgp, false, false, addr),
+            )
+            .await
+            .expect("startup must return instead of running without an API listener")
+            .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+            assert!(err.to_string().contains(&format!("gRPC API {addr}")));
         }
     }
 
